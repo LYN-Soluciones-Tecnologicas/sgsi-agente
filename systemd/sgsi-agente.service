@@ -1,0 +1,18 @@
+# Ejecución puntual del agente; la periodicidad la pone el timer.
+[Unit]
+Description=Agente SGSI: descubrimiento y comprobaciones del servidor
+Documentation=https://github.com/LYN-Soluciones-Tecnologicas/sgsi-agente
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sgsi-agente
+Nice=10
+IOSchedulingClass=idle
+# El agente es de solo lectura: /usr, /boot y /etc quedan montados
+# de solo lectura para él; solo escribe su informe en /var/lib.
+ProtectSystem=full
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes

@@ -1,0 +1,13 @@
+[Unit]
+Description=Ejecución periódica del agente SGSI
+
+[Timer]
+# A los 5 minutos de arrancar y luego cada 6 horas, con un poco de azar
+# para que los servidores no reporten todos en el mismo segundo.
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

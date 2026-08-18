@@ -130,15 +130,24 @@ hallazgo cuando un servidor lleve más de dos periodos sin reportar
 El token es **por servidor**, se genera al enrolarlo y solo sirve para
 entregar informes: robarlo no da acceso a nada del SGSI.
 
-## Hoja de ruta (lado sgsi-lyn)
+## El lado sgsi-lyn (hecho)
 
-1. Migración: tablas `agentes` (id, nombre, hash del token, último informe)
-   e ingesta del informe.
-2. Endpoint `POST /api/agentes/informe` autenticado por token de agente.
-3. Proveedor `agente` con su conector: `descubrir()` lee los informes
-   (servidor + aplicaciones como recursos externos, mapeables a activos),
-   `comprobar()` evalúa con las definiciones `srv-*` de `comprobaciones.ts`,
-   con severidad, requisitos y remediación paso a paso como el resto.
-4. Enrolado desde la pantalla de integraciones: alta del servidor → token →
-   pegar en `/etc/sgsi-agente/config`.
-5. `agente-latido`: hallazgo automático si un servidor deja de reportar.
+El backend del SGSI ya tiene la contrapartida completa:
+
+- Tabla `agente_servidor` (nombre, hash del token, último informe con fecha)
+  y endpoint público `POST /api/agentes/informe` autenticado por token.
+- Enrolado por API: `POST /api/agentes {nombre}` devuelve el token **una
+  única vez**; `POST /api/agentes/:id/token` lo rota.
+- Proveedor `agente` con su conector: `descubrir()` inventaría el servidor
+  como activo y cada **servicio** como recurso externo mapeable (fundiendo
+  proyectos compose, contenedores sueltos, directorios con repo y unidades
+  systemd propias); `comprobar()` re-evalúa el informe crudo con las
+  definiciones `srv-*` de `comprobaciones.ts` (el agente mide, el backend
+  juzga; la única excepción es `srv-puertos`, cuya línea base vive en el
+  servidor).
+- `agente-latido`: hallazgo automático si un servidor calla más de 24 horas
+  o se enroló y nunca reportó.
+
+Pendiente: pantalla de enrolado en el frontend (hoy se enrola por API) y
+etiquetas OCI en los builds de `lyn-actions` para que toda imagen declare su
+repositorio de origen.

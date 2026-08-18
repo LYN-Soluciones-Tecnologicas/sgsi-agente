@@ -24,7 +24,7 @@
 # Requiere: bash 4+, jq, coreutils. Todo lo demás (docker, ss, ufw, nft,
 # sshd, fail2ban, nginx, openssl…) se usa solo si está.
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CONFIG="/etc/sgsi-agente/config"
 ESTADO_DIR="/var/lib/sgsi-agente"
 
@@ -140,6 +140,12 @@ col_contenedores() {
       proyectoCompose: (.Config.Labels["com.docker.compose.project"] // null),
       servicioCompose: (.Config.Labels["com.docker.compose.service"] // null),
       directorioCompose: (.Config.Labels["com.docker.compose.project.working_dir"] // null),
+      # Repo de origen aunque no haya checkout en disco: la etiqueta OCI que
+      # GitHub Actions/GHCR ponen al construir, o inferido del nombre ghcr.io.
+      repositorio: ((.Config.Labels["org.opencontainers.image.source"] // null)
+                    // ([.Config.Image | capture("^ghcr\\.io/(?<org>[^/]+)/(?<repo>[^/:@]+)")] | .[0]
+                        | if . then "https://github.com/" + .org + "/" + .repo else null end)),
+      revision: (.Config.Labels["org.opencontainers.image.revision"] // null),
       puertos: [ (.NetworkSettings.Ports // {}) | to_entries[]
                  | {interno: .key,
                     publicaciones: ((.value // []) | map({ip: .HostIp, puerto: .HostPort}))} ],

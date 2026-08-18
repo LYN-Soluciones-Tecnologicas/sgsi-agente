@@ -36,7 +36,7 @@ Linux (IONOS, DigitalOcean, o el que venga).
 |---|---|
 | `servidor` | Hostname, distro, kernel, virtualización, IPs, CPU/RAM, arranque |
 | `servicios` | Unidades systemd con su estado; marca cuáles son «propias» (instaladas a mano en `/etc/systemd/system`, primeras candidatas a activo) |
-| `contenedores` | Docker: imagen, estado, salud, reinicios, **proyecto/servicio/directorio de docker compose**, puertos publicados y si expone a internet |
+| `contenedores` | Docker: imagen, estado, salud, reinicios, **proyecto/servicio/directorio de docker compose**, puertos publicados, si expone a internet, y **repositorio de origen aunque no haya checkout en disco** (etiqueta OCI `org.opencontainers.image.source` o inferido de `ghcr.io/<org>/<repo>`) |
 | `aplicaciones` | Directorios de despliegue detectados (compose, cwd de procesos vivos, `/var/www`, `/srv`, `/opt`, `/home/*`) con **repositorio git de origen, rama, commit y fecha** |
 | `red.puertos` | Todo lo que escucha: protocolo, puerto, dirección de escucha, proceso, y si está expuesto |
 | `web` | Dominios servidos (nginx/apache) y certificados TLS con días restantes |
@@ -59,6 +59,14 @@ versión corre* (`rama`, `commit`, `fechaCommit`) y, cruzando con
 `directorioCompose`). Con eso, la pantalla de integraciones del SGSI puede
 ofrecer el mismo flujo que ya usa con GitHub: recurso descubierto → persona
 decide → activo inventariado.
+
+Cuando el servicio corre solo como contenedor (imagen del registro, sin
+checkout en disco), el repositorio sale de la etiqueta OCI
+`org.opencontainers.image.source` de la imagen, o se infiere si viene de
+`ghcr.io/<org>/<repo>`. Si tampoco así aparece, el recurso queda inventariado
+igualmente (por proyecto/servicio de compose) y el mapeo se hace a mano en la
+app — y la corrección de fondo es añadir las etiquetas OCI en los builds de
+`lyn-actions`, para que toda imagen futura declare de qué repo viene.
 
 ## Comprobaciones del resumen local
 

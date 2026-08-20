@@ -8,13 +8,18 @@
 # Cinco reglas de diseño, en el orden en que importan:
 #
 #   1. SOLO LECTURA. No cambia nada del sistema; lo único que escribe es su
-#      propio informe en /var/lib/sgsi-agente.
+#      propio estado (informe, token, invitación) en /var/lib/sgsi-agente.
+#      La única excepción es `--enrolar URL`, que una persona ejecuta a mano
+#      y guarda SGSI_URL en la config.
 #   2. MIDE, NO JUZGA. El informe son hechos crudos; los criterios de qué está
 #      bien o mal viven en el backend (comprobaciones.ts) y se revisan por
 #      pull request. El «resumen» local es una evaluación de cortesía para
 #      poder usar el agente suelto, no la fuente de verdad.
-#   3. UNIDIRECCIONAL. El agente empuja; el backend jamás le ordena nada. No
-#      hay canal de vuelta, no hay ejecución remota, no hay túnel.
+#   3. LOS DATOS SOLO SUBEN. El agente empuja; no hay ejecución remota ni
+#      túnel. Lo único que baja por el sondeo son dos banderas sin parámetros
+#      («genera tu informe ya», «actualízate desde tu git») que este mismo
+#      script ejecuta con su propio código: comprometer el SGSI, como mucho,
+#      hace que un servidor se mida antes de hora.
 #   4. SIN SECRETOS (regla 7 del SGSI). Huellas de claves, nunca claves;
 #      nombres de ficheros .env, nunca contenidos; URLs de git sin usuario ni
 #      token; líneas de cron con las credenciales tachadas.
@@ -24,9 +29,17 @@
 # Requiere: bash 4+, jq, coreutils. Todo lo demás (docker, ss, ufw, nft,
 # sshd, fail2ban, nginx, openssl…) se usa solo si está.
 
-VERSION="0.2.0"
+VERSION="0.4.0"
 CONFIG="/etc/sgsi-agente/config"
 ESTADO_DIR="/var/lib/sgsi-agente"
+# El token de entrega y el código de invitación viven en el estado del agente
+# (0700, root). SGSI_TOKEN en la config, si alguien lo pega a mano, manda.
+TOKEN_FICHERO="$ESTADO_DIR/token"
+INVITACION_FICHERO="$ESTADO_DIR/invitacion"
+# Commit del que se instaló el agente (lo escribe instalar.sh) y checkout de
+# trabajo para las actualizaciones. Ambos, estado del agente.
+VERSION_FICHERO="$ESTADO_DIR/version-instalada"
+REPO_DIR="$ESTADO_DIR/repo"
 
 set -o nounset -o pipefail
 export LC_ALL=C
@@ -36,6 +49,10 @@ SGSI_URL=""
 SGSI_TOKEN=""
 BACKUP_RUTA=""
 PUERTOS_ESPERADOS=""
+# Cadencia del sondeo de solicitudes; el backend puede ajustarla en caliente.
+SONDEO_SEGUNDOS=5
+# De dónde se actualiza el agente cuando el SGSI lo solicita.
+REPO_URL="https://github.com/LYN-Soluciones-Tecnologicas/sgsi-agente.git"
 # shellcheck disable=SC1090
 [ -r "$CONFIG" ] && . "$CONFIG"
 
@@ -742,12 +759,280 @@ evaluar() {
     ]'
 }
 
+# ── Enrolado por invitación ────────────────────────────────────────────────
+# Con solo SGSI_URL en la config, el agente pide una invitación al backend y
+# sondea con su código hasta que una persona la acepta en la pantalla de
+# integraciones; entonces recibe el token (una única vez) y lo guarda en
+# $TOKEN_FICHERO. El código de verificación que se imprime aquí debe
+# coincidir con el que enseña la pantalla: es lo que ata la invitación a
+# ESTE servidor y no a un impostor que conozca el hostname.
+
+token_actual() {
+  if [ -n "$SGSI_TOKEN" ]; then
+    printf '%s' "$SGSI_TOKEN"
+  elif [ -r "$TOKEN_FICHERO" ]; then
+    head -1 "$TOKEN_FICHERO" | tr -d '[:space:]'
+  fi
+}
+
+# Pide una invitación nueva y guarda su código en $INVITACION_FICHERO.
+invitacion_crear() {
+  local respuesta codigo verificacion
+  respuesta=$(curl -fsS --max-time 30 -X POST "${SGSI_URL%/}/api/agentes/invitaciones" \
+    -H "Content-Type: application/json" \
+    --data "$(jq -n --arg nombre "$(hostname)" '{nombre: $nombre}')" 2>/dev/null) || return 1
+  codigo=$(jq -r '.codigo // empty' <<< "$respuesta")
+  verificacion=$(jq -r '.codigoVerificacion // empty' <<< "$respuesta")
+  [ -n "$codigo" ] || return 1
+  umask 077
+  mkdir -p "$ESTADO_DIR"
+  printf '%s\n' "$codigo" > "$INVITACION_FICHERO"
+  echo "invitación creada para $(hostname); acéptala en ${SGSI_URL%/} (Integraciones → Agentes)" >&2
+  echo "CÓDIGO DE VERIFICACIÓN: $verificacion — debe coincidir con el de la pantalla" >&2
+}
+
+# Un intento de canje del código. Códigos de salida:
+#   0 token obtenido · 1 sigue pendiente (o la red falló) · 2 no va a llegar
+invitacion_canjear() {
+  local codigo respuesta http estado token verificacion
+  codigo=$(head -1 "$INVITACION_FICHERO" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$codigo" ] || return 2
+  case "$codigo" in
+    rechazada:*)
+      # Ya nos dijeron que no: el agente deja de insistir. `--enrolar` lo
+      # reintenta si fue un error; `desinstalar.sh` lo retira si no lo fue.
+      return 2 ;;
+  esac
+
+  respuesta=$(mktemp)
+  http=$(curl -sS --max-time 30 -o "$respuesta" -w '%{http_code}' \
+    -X POST "${SGSI_URL%/}/api/agentes/invitaciones/canje" \
+    -H "Content-Type: application/json" \
+    --data "$(jq -n --arg codigo "$codigo" '{codigo: $codigo}')" 2>/dev/null) || {
+      rm -f "$respuesta"; return 1; }
+
+  if [ "$http" = "404" ]; then
+    # El backend ya no conoce este código (invitación sustituida o purgada):
+    # se pedirá una nueva en la siguiente pasada.
+    rm -f "$respuesta" "$INVITACION_FICHERO"
+    return 2
+  fi
+  [ "$http" = "200" ] || { rm -f "$respuesta"; return 1; }
+
+  estado=$(jq -r '.estado // empty' "$respuesta" 2>/dev/null)
+  token=$(jq -r '.token // empty' "$respuesta" 2>/dev/null)
+  verificacion=$(jq -r '.codigoVerificacion // empty' "$respuesta" 2>/dev/null)
+  rm -f "$respuesta"
+
+  case "$estado" in
+    aceptada)
+      [ -n "$token" ] || return 1
+      umask 077
+      printf '%s\n' "$token" > "$TOKEN_FICHERO"
+      rm -f "$INVITACION_FICHERO"
+      echo "servidor enrolado: token recibido y guardado en $TOKEN_FICHERO" >&2
+      return 0 ;;
+    pendiente)
+      echo "invitación pendiente de aceptar en ${SGSI_URL%/} (verificación: $verificacion)" >&2
+      return 1 ;;
+    rechazada)
+      printf 'rechazada:%s\n' "$codigo" > "$INVITACION_FICHERO"
+      echo "AVISO: la invitación fue RECHAZADA en el SGSI; el agente no volverá a pedirla." >&2
+      echo "       Si es un error: sgsi-agente --enrolar. Si no lo es: ./desinstalar.sh" >&2
+      return 2 ;;
+    expirada|consumida)
+      rm -f "$INVITACION_FICHERO"
+      echo "AVISO: la invitación quedó «$estado»; se pedirá una nueva en la siguiente pasada" >&2
+      return 2 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+# Si hay URL pero no token, mantiene vivo el ciclo de invitación: crea una si
+# no existe y prueba un canje. Cada pasada del timer lo reintenta solo.
+asegurar_token() {
+  [ -n "$SGSI_URL" ] || return 0
+  [ -n "$(token_actual)" ] && return 0
+  [ -f "$INVITACION_FICHERO" ] || invitacion_crear || return 0
+  invitacion_canjear || true
+}
+
+# Guarda SGSI_URL en la config. Único caso en que el agente escribe fuera de
+# su estado, y solo porque una persona lo pide con `--enrolar URL`.
+guardar_url_config() {
+  local url="$1"
+  umask 077
+  mkdir -p "$(dirname "$CONFIG")"
+  touch "$CONFIG"
+  chmod 600 "$CONFIG"
+  if grep -q '^SGSI_URL=' "$CONFIG" 2>/dev/null; then
+    sed -i "s|^SGSI_URL=.*|SGSI_URL=\"$url\"|" "$CONFIG"
+  elif grep -q '^#SGSI_URL=' "$CONFIG" 2>/dev/null; then
+    sed -i "s|^#SGSI_URL=.*|SGSI_URL=\"$url\"|" "$CONFIG"
+  else
+    printf 'SGSI_URL="%s"\n' "$url" >> "$CONFIG"
+  fi
+}
+
+# Enrolado interactivo: crea (o renueva) la invitación y espera en primer
+# plano a que alguien la acepte. Si nadie responde, no pasa nada: el timer
+# seguirá sondeando en cada pasada.
+enrolar() {
+  local url="${1:-}"
+  if [ -n "$url" ]; then
+    SGSI_URL="$url"
+    guardar_url_config "$url"
+  fi
+  [ -n "$SGSI_URL" ] || {
+    echo "ERROR: falta la URL del SGSI (sgsi-agente --enrolar https://sgsi.ejemplo.es)" >&2
+    exit 1
+  }
+  if [ -n "$(token_actual)" ]; then
+    echo "este servidor ya tiene token; si quieres uno nuevo, rota desde la web o borra $TOKEN_FICHERO" >&2
+    exit 0
+  fi
+
+  rm -f "$INVITACION_FICHERO"
+  invitacion_crear || {
+    echo "ERROR: no se pudo crear la invitación en ${SGSI_URL%/}" >&2
+    exit 1
+  }
+
+  echo "esperando la aceptación (Ctrl-C para dejarlo; el timer seguirá sondeando solo)…" >&2
+  local _intento
+  # shellcheck disable=SC2034
+  for _intento in $(seq 1 90); do
+    sleep 10
+    invitacion_canjear
+    case $? in
+      0)
+        echo "generando y enviando el primer informe…" >&2
+        exec "$0" ;;
+      2)
+        exit 1 ;;
+    esac
+  done
+  echo "AVISO: nadie respondió en 15 minutos; el agente seguirá sondeando en cada pasada del timer" >&2
+  exit 0
+}
+
+# ── Sondeo de solicitudes ──────────────────────────────────────────────────
+# Bucle del servicio sgsi-agente-sondeo: cada pocos segundos pregunta al SGSI
+# si hay algo pendiente. Lo único que puede bajar son dos banderas sin
+# parámetros —«genera tu informe ya» y «actualízate»— y quien las ejecuta es
+# este mismo script con su propio código: no hay ejecución remota. Sin token,
+# el sondeo empuja el enrolado, así el canje llega en segundos en cuanto
+# alguien acepta la invitación en la web.
+
+sondeo() {
+  if [ -z "$SGSI_URL" ]; then
+    echo "sin SGSI_URL en la config; sondeo dormido (se relee en 5 minutos)" >&2
+    sleep 300
+    exec "$0" --sondeo
+  fi
+  echo "sondeo en marcha contra ${SGSI_URL%/} (cada ${SONDEO_SEGUNDOS}s)" >&2
+
+  local token cuerpo http escanear actualizar intervalo
+  while true; do
+    token=$(token_actual)
+    if [ -z "$token" ]; then
+      asegurar_token
+      sleep "$SONDEO_SEGUNDOS"
+      continue
+    fi
+
+    cuerpo=$(mktemp)
+    http=$(curl -sS --max-time 15 -o "$cuerpo" -w '%{http_code}' \
+      -X POST "${SGSI_URL%/}/api/agentes/sondeo" \
+      -H "Authorization: Bearer $token" 2>/dev/null) || http=""
+
+    if [ "$http" = "200" ]; then
+      escanear=$(jq -r 'if .escanear == true then "si" else "no" end' "$cuerpo" 2>/dev/null)
+      actualizar=$(jq -r 'if .actualizar == true then "si" else "no" end' "$cuerpo" 2>/dev/null)
+      intervalo=$(jq -r '.intervaloSegundos // empty' "$cuerpo" 2>/dev/null)
+      rm -f "$cuerpo"
+      case "$intervalo" in (*[!0-9]*|'') ;; (*) SONDEO_SEGUNDOS="$intervalo" ;; esac
+
+      if [ "$actualizar" = "si" ]; then
+        echo "solicitud de actualización recibida" >&2
+        "$0" --actualizar
+        case $? in
+          0)
+            # Hay binario nuevo: informe con la versión nueva y reexec del
+            # sondeo para soltar el código viejo que este proceso lleva en
+            # memoria.
+            /usr/local/sbin/sgsi-agente || true
+            exec /usr/local/sbin/sgsi-agente --sondeo ;;
+          3) : ;;                     # ya estaba en la última versión
+          *) echo "AVISO: la actualización falló; se reintentará si se vuelve a solicitar" >&2 ;;
+        esac
+      fi
+      if [ "$escanear" = "si" ]; then
+        echo "solicitud de escaneo recibida: generando informe…" >&2
+        "$0" || true
+      fi
+    else
+      rm -f "$cuerpo"
+      if [ "$http" = "401" ]; then
+        echo "AVISO: el SGSI no reconoce el token (¿rotado o agente borrado?); sondeo en pausa de 5 minutos" >&2
+        sleep 300
+        exec "$0" --sondeo
+      fi
+      # Red caída o backend fuera: se reintenta al siguiente latido.
+    fi
+
+    sleep "$SONDEO_SEGUNDOS"
+  done
+}
+
+# ── Actualización desde git ────────────────────────────────────────────────
+# Clona el repositorio (somero, siempre la rama por defecto), compara el
+# commit remoto con el instalado (version-instalada, lo escribe instalar.sh)
+# y, si difieren, reinstala. Config, token e informes se conservan: la
+# instalación no los toca. Códigos de salida: 0 actualizado · 3 ya al día ·
+# 1 error.
+actualizar() {
+  [ "$(id -u)" = 0 ] || { echo "ERROR: la actualización necesita root" >&2; exit 1; }
+  hay git || { echo "ERROR: hace falta git para actualizar (apt-get install git)" >&2; exit 1; }
+
+  umask 077
+  mkdir -p "$ESTADO_DIR"
+  # Clon fresco cada vez: el repo es minúsculo y así no hay estados raros.
+  rm -rf "$REPO_DIR"
+  if ! git clone --quiet --depth 1 "$REPO_URL" "$REPO_DIR" 2>/dev/null; then
+    echo "ERROR: no se pudo clonar $REPO_URL" >&2
+    exit 1
+  fi
+
+  local remoto instalado
+  remoto=$(git -C "$REPO_DIR" rev-parse HEAD)
+  instalado=$(head -1 "$VERSION_FICHERO" 2>/dev/null || true)
+  if [ "$remoto" = "$instalado" ]; then
+    echo "el agente ya está en la última versión ($(git -C "$REPO_DIR" rev-parse --short HEAD))" >&2
+    exit 3
+  fi
+
+  echo "actualizando del commit ${instalado:-desconocido} al $remoto" >&2
+  if ! (cd "$REPO_DIR" && ./instalar.sh); then
+    echo "ERROR: la instalación de la versión nueva falló" >&2
+    exit 1
+  fi
+  echo "agente actualizado a $(git -C "$REPO_DIR" rev-parse --short HEAD)" >&2
+  exit 0
+}
+
 # ── Envío al SGSI ──────────────────────────────────────────────────────────
 enviar() {
-  local fichero="$1"
-  [ -n "$SGSI_URL" ] && [ -n "$SGSI_TOKEN" ] || return 0
+  local fichero="$1" token
+  [ -n "$SGSI_URL" ] || return 0
+  token=$(token_actual)
+  if [ -z "$token" ]; then
+    echo "AVISO: sin token todavía (invitación sin aceptar); el informe queda en $fichero" >&2
+    return 0
+  fi
   if curl -fsS --max-time 60 -X POST "${SGSI_URL%/}/api/agentes/informe" \
-       -H "Authorization: Bearer $SGSI_TOKEN" \
+       -H "Authorization: Bearer $token" \
        -H "Content-Type: application/json" \
        --data-binary @"$fichero" >/dev/null 2>&1; then
     echo "informe enviado a ${SGSI_URL%/}" >&2
@@ -763,6 +1048,14 @@ sgsi-agente $VERSION — descubre y mide el estado de este servidor para el SGSI
 
 Uso: sgsi-agente [opción]
   (sin opción)  genera el informe, lo guarda en $ESTADO_DIR y lo envía si hay config
+  --enrolar [URL]  pide una invitación de enrolado al SGSI y espera a que
+                alguien la acepte en la web; con URL, además la guarda en la
+                config. El token llega solo: no hay nada que copiar a mano.
+  --sondeo      bucle del servicio sgsi-agente-sondeo: pregunta al SGSI cada
+                pocos segundos si hay solicitudes («escanear ahora»,
+                «actualizar agente») y las atiende
+  --actualizar  clona el repositorio, compara con el commit instalado y, si
+                hay versión nueva, reinstala conservando config y token
   --stdout      imprime el informe completo y no guarda ni envía nada
   --resumen     imprime solo la tabla de comprobaciones, legible
   --seccion N   imprime solo una sección (servidor, servicios, contenedores,
@@ -836,6 +1129,14 @@ main() {
   case "${1:-}" in
     --version) echo "sgsi-agente $VERSION"; exit 0 ;;
     -h|--ayuda|--help) uso; exit 0 ;;
+    --enrolar)
+      [ "$(id -u)" = 0 ] || { echo "ERROR: el enrolado necesita root (escribe token y config)" >&2; exit 1; }
+      enrolar "${2:-}" ;;
+    --sondeo)
+      [ "$(id -u)" = 0 ] || { echo "ERROR: el sondeo necesita root (genera informes y actualiza)" >&2; exit 1; }
+      sondeo ;;
+    --actualizar)
+      actualizar ;;
     --seccion)
       [ -n "${2:-}" ] || { uso; exit 1; }
       case "$2" in
@@ -869,6 +1170,9 @@ main() {
   mv -f "$temporal" "$destino"
   echo "informe en $destino" >&2
 
+  # Sin token pero con URL: el ciclo de invitación sigue vivo en cada pasada
+  # del timer, así el enrolado termina solo cuando alguien acepta en la web.
+  asegurar_token
   enviar "$destino"
 
   # Resumen a stderr: si se lanza a mano, se ve el estado de un vistazo.

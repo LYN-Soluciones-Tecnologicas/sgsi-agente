@@ -6,7 +6,9 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Ejecuta la desinstalación como root."; exit 1; }
 
 systemctl disable --now sgsi-agente.timer 2>/dev/null || true
-rm -f /etc/systemd/system/sgsi-agente.service /etc/systemd/system/sgsi-agente.timer
+systemctl disable --now sgsi-agente-sondeo.service 2>/dev/null || true
+rm -f /etc/systemd/system/sgsi-agente.service /etc/systemd/system/sgsi-agente.timer \
+      /etc/systemd/system/sgsi-agente-sondeo.service
 systemctl daemon-reload
 rm -f /usr/local/sbin/sgsi-agente
 

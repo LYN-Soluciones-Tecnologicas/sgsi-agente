@@ -1,0 +1,23 @@
+# Sondeo de solicitudes: pregunta al SGSI cada pocos segundos si alguien pidió
+# «escanear ahora» o «actualizar agente» desde la pantalla, y las atiende.
+# Sin token, este mismo bucle empuja el enrolado por invitación.
+[Unit]
+Description=Agente SGSI: sondeo de solicitudes (escaneo y actualización)
+Documentation=https://github.com/LYN-Soluciones-Tecnologicas/sgsi-agente
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/sgsi-agente --sondeo
+Restart=always
+RestartSec=30
+Nice=10
+IOSchedulingClass=idle
+# A diferencia del timer de informes, aquí NO cabe ProtectSystem: atender una
+# actualización escribe /usr/local/sbin y /etc/systemd/system. El servicio
+# sigue sin escuchar ningún puerto: solo hace peticiones salientes al SGSI.
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

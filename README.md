@@ -20,10 +20,12 @@ Linux (IONOS, DigitalOcean, o el que venga).
    está bien o mal viven en el backend del SGSI (`comprobaciones.ts`) y se
    revisan por pull request. El `resumen` local es una evaluación de cortesía
    para poder usar el agente suelto, no la fuente de verdad.
-3. **Unidireccional.** El agente empuja; el backend jamás le ordena nada. No
-   hay canal de vuelta, ni ejecución remota, ni túnel. Ante un auditor (y
-   ante un atacante) esto importa: comprometer el SGSI no da acceso a los
-   servidores.
+3. **Los datos solo suben.** El agente empuja; no hay ejecución remota ni
+   túnel. Lo único que baja por el sondeo son dos banderas sin parámetros
+   («genera tu informe ya», «actualízate desde tu git») que el propio agente
+   ejecuta con su propio código. Ante un auditor (y ante un atacante) esto
+   importa: comprometer el SGSI no da acceso a los servidores; como mucho,
+   les hace medirse antes de hora.
 4. **Sin secretos** (regla 7 del SGSI). Huellas de claves SSH, nunca claves;
    nombres y permisos de ficheros `.env`, nunca contenidos; URLs de git con
    las credenciales tachadas; líneas de cron saneadas.
@@ -99,13 +101,16 @@ cuando exista el conector (`requisitos` de ISO 27001:2022 entre paréntesis):
 ```bash
 git clone https://github.com/LYN-Soluciones-Tecnologicas/sgsi-agente.git
 cd sgsi-agente
-sudo ./instalar.sh
+sudo ./instalar.sh https://sgsi.lynsoluciones.es
 ```
 
 El instalador deja el agente en `/usr/local/sbin/sgsi-agente` (root, 0700),
 la configuración en `/etc/sgsi-agente/config` (0600) y un timer de systemd
-que lo ejecuta cada 6 horas. `sudo ./desinstalar.sh` lo retira conservando
-config e informes.
+que lo ejecuta cada 6 horas. Con la URL como argumento, además **pide el
+enrolado**: imprime un código de verificación y espera a que alguien acepte
+la invitación en la web del SGSI (ver «Enrolado por invitación»). Sin URL,
+instala igual y el enrolado se hace después con `sudo sgsi-agente --enrolar
+https://…`. `sudo ./desinstalar.sh` lo retira conservando config e informes.
 
 ### Uso a mano
 
@@ -118,17 +123,84 @@ sudo sgsi-agente --seccion aplicaciones   # una sección concreta
 Sin root funciona, pero el informe queda incompleto (claves SSH, procesos de
 otros usuarios, `sshd -T`) y lo dice.
 
+## Enrolado por invitación
+
+La vía normal de conectar el agente al SGSI. En el servidor solo se define
+**la URL de la web** (config o `--enrolar URL`); el token no se copia a mano
+en ninguna dirección:
+
+1. El agente hace `POST /api/agentes/invitaciones {nombre: hostname}` y
+   recibe un **código de sondeo** secreto (`sgi_…`, solo lo conoce este
+   servidor) más un **código de verificación** corto que imprime en consola.
+2. La invitación aparece en la web del SGSI (Integraciones → Agentes) con el
+   mismo código de verificación. Una persona lo coteja con la consola del
+   servidor y **acepta o rechaza**: eso es lo que impide que un impostor que
+   conozca el hostname cuele su propia máquina.
+3. El agente sondea `POST /api/agentes/invitaciones/canje {codigo}` —en
+   primer plano si se lanzó `--enrolar`, o una vez por pasada del timer— y,
+   cuando la invitación está aceptada, el token nace **en ese momento** y
+   viaja una única vez: queda en `/var/lib/sgsi-agente/token` (0600) y en el
+   backend solo vive su hash. Un segundo canje del mismo código ya solo ve
+   «consumida».
+
+Las invitaciones caducan a las 24 horas; una rechazada deja al agente en
+silencio (no insiste) hasta que alguien vuelva a lanzar `--enrolar`. La vía
+antigua sigue existiendo: generar el token en la web y pegarlo como
+`SGSI_TOKEN` en la config, que manda sobre el fichero de token.
+
+## Sondeo: «escanear ahora» y «actualizar agente» desde la web
+
+El servicio `sgsi-agente-sondeo` (systemd, `Restart=always`) pregunta al SGSI
+cada **5 segundos** si hay solicitudes pendientes, con el mismo token de
+entrega. La respuesta son dos banderas sin parámetros, entregadas una sola
+vez:
+
+- **escanear** — el agente genera y envía un informe completo al momento, sin
+  esperar al timer de 6 horas. Es lo que hay detrás del botón «Escanear
+  ahora» de cada servidor en la pantalla de integraciones.
+- **actualizar** — el agente clona su repositorio (somero, rama por defecto),
+  compara el commit remoto con el instalado (`/var/lib/sgsi-agente/
+  version-instalada`, lo escribe `instalar.sh`) y, si difieren, reinstala
+  conservando config, token e informes; después envía un informe con la
+  versión nueva y el sondeo se re-ejecuta para soltar el código viejo. Botón
+  «Actualizar agente».
+
+El mismo bucle empuja el enrolado cuando aún no hay token: la invitación se
+canjea en segundos en cuanto alguien la acepta. La pantalla enseña si el
+sondeo está **en línea** (último latido hace segundos); si no lo está, las
+solicitudes quedan en cola hasta que vuelva. La cadencia la decide el
+backend (viaja en cada respuesta) y se puede fijar con `SONDEO_SEGUNDOS` en
+la config; el repositorio de actualización, con `REPO_URL`.
+
+## Actualizar a mano un agente antiguo
+
+Un agente anterior al sondeo no puede actualizarse desde la web (no hay
+nadie escuchando). En el servidor:
+
+```bash
+cd sgsi-agente        # el checkout desde el que se instaló…
+git pull              # …o clona de nuevo si ya no está
+sudo ./instalar.sh
+```
+
+La instalación conserva config, token e informes, apunta el commit instalado
+y deja en marcha el servicio de sondeo: a partir de ahí las siguientes
+actualizaciones ya se piden desde la pantalla. `sudo sgsi-agente
+--actualizar` hace lo mismo sin checkout previo (clona él solo), y sirve
+también para comprobar si hay versión nueva: dice «ya está en la última
+versión» y no toca nada.
+
 ## Envío al SGSI
 
-Con `SGSI_URL` y `SGSI_TOKEN` en la config, cada pasada hace
+Con la URL configurada y el token obtenido, cada pasada hace
 `POST $SGSI_URL/api/agentes/informe` con `Authorization: Bearer` y el JSON
 como cuerpo. Si el envío falla, el informe queda en disco y se reintenta en
 la siguiente pasada; el propio silencio es señal: el backend debe abrir
 hallazgo cuando un servidor lleve más de dos periodos sin reportar
 (`agente-latido`), porque un agente muerto no puede parecer un servidor sano.
 
-El token es **por servidor**, se genera al enrolarlo y solo sirve para
-entregar informes: robarlo no da acceso a nada del SGSI.
+El token es **por servidor** y solo sirve para entregar informes: robarlo no
+da acceso a nada del SGSI.
 
 ## El lado sgsi-lyn (hecho)
 
@@ -136,8 +208,11 @@ El backend del SGSI ya tiene la contrapartida completa:
 
 - Tabla `agente_servidor` (nombre, hash del token, último informe con fecha)
   y endpoint público `POST /api/agentes/informe` autenticado por token.
-- Enrolado por API: `POST /api/agentes {nombre}` devuelve el token **una
-  única vez**; `POST /api/agentes/:id/token` lo rota.
+- Enrolado por invitación (tabla `agente_invitacion`, endpoints públicos de
+  alta y canje, y la pantalla de integraciones donde una persona acepta o
+  rechaza cotejando el código de verificación). El alta manual por API sigue:
+  `POST /api/agentes {nombre}` devuelve el token **una única vez**;
+  `POST /api/agentes/:id/token` lo rota.
 - Proveedor `agente` con su conector: `descubrir()` inventaría el servidor
   como activo y cada **servicio** como recurso externo mapeable (fundiendo
   proyectos compose, contenedores sueltos, directorios con repo y unidades
@@ -145,9 +220,21 @@ El backend del SGSI ya tiene la contrapartida completa:
   definiciones `srv-*` de `comprobaciones.ts` (el agente mide, el backend
   juzga; la única excepción es `srv-puertos`, cuya línea base vive en el
   servidor).
+- **Reconciliación con el inventario**: en la pantalla de integraciones, el
+  panel «Recursos» de cada integración enseña lo descubierto y su vínculo
+  con los activos. «Reconciliar con IA» pide al modelo que proponga, por
+  cada recurso sin activo, si ES un activo que ya existe (vincular) o si
+  merece alta propia (crear); la propuesta queda pendiente y **la firma una
+  persona** —regla 3—, que también puede vincular a mano sin modelo.
+- **Sondeo de solicitudes**: `POST /api/agentes/sondeo` (token del agente)
+  entrega las banderas pendientes una sola vez y registra el latido;
+  `POST /api/agentes/:id/escaneo` y `POST /api/agentes/:id/actualizacion`
+  son los botones «Escanear ahora» y «Actualizar agente» de la pantalla, que
+  además enseña si el sondeo está en línea y la versión del agente.
 - `agente-latido`: hallazgo automático si un servidor calla más de 24 horas
   o se enroló y nunca reportó.
+- La pestaña de hallazgos filtra por **fuente**: cada proveedor (github,
+  dns, agente…) y, dentro de `agente`, cada servidor por separado.
 
-Pendiente: pantalla de enrolado en el frontend (hoy se enrola por API) y
-etiquetas OCI en los builds de `lyn-actions` para que toda imagen declare su
-repositorio de origen.
+Pendiente: etiquetas OCI en los builds de `lyn-actions` para que toda imagen
+declare su repositorio de origen.

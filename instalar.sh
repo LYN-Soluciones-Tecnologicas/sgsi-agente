@@ -55,6 +55,19 @@ FIN
   chmod 0600 /etc/sgsi-agente/config
 fi
 
+# La URL entra en la config ANTES de arrancar el sondeo: así el servicio nace
+# ya apuntando al SGSI y empuja el enrolado desde el primer latido.
+if [ -n "$URL_SGSI" ]; then
+  echo "· configurando SGSI_URL=$URL_SGSI"
+  if grep -q '^SGSI_URL=' /etc/sgsi-agente/config; then
+    sed -i "s|^SGSI_URL=.*|SGSI_URL=\"$URL_SGSI\"|" /etc/sgsi-agente/config
+  elif grep -q '^#SGSI_URL=' /etc/sgsi-agente/config; then
+    sed -i "s|^#SGSI_URL=.*|SGSI_URL=\"$URL_SGSI\"|" /etc/sgsi-agente/config
+  else
+    printf 'SGSI_URL="%s"\n' "$URL_SGSI" >> /etc/sgsi-agente/config
+  fi
+fi
+
 echo "· instalando unidades de systemd"
 install -m 0644 systemd/sgsi-agente.service systemd/sgsi-agente.timer \
   systemd/sgsi-agente-sondeo.service /etc/systemd/system/

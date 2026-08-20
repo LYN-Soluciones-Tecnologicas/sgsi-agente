@@ -793,8 +793,17 @@ invitacion_crear() {
 
 # Un intento de canje del código. Códigos de salida:
 #   0 token obtenido · 1 sigue pendiente (o la red falló) · 2 no va a llegar
+#
+# Puede haber DOS sondeadores a la vez (el servicio de sondeo y un --enrolar
+# en primer plano): el que pierde la carrera se encuentra la invitación
+# consumida o el fichero borrado. Si el token ya está, eso no es un fallo,
+# es que el otro llegó antes.
 invitacion_canjear() {
   local codigo respuesta http estado token verificacion
+  if [ -n "$(token_actual)" ]; then
+    rm -f "$INVITACION_FICHERO"
+    return 0
+  fi
   codigo=$(head -1 "$INVITACION_FICHERO" 2>/dev/null | tr -d '[:space:]')
   [ -n "$codigo" ] || return 2
   case "$codigo" in
@@ -842,6 +851,8 @@ invitacion_canjear() {
       return 2 ;;
     expirada|consumida)
       rm -f "$INVITACION_FICHERO"
+      # «consumida» con token en disco = el otro sondeador ganó la carrera.
+      [ -n "$(token_actual)" ] && return 0
       echo "AVISO: la invitación quedó «$estado»; se pedirá una nueva en la siguiente pasada" >&2
       return 2 ;;
     *)
@@ -899,11 +910,11 @@ enrolar() {
     exit 1
   }
 
-  echo "esperando la aceptación (Ctrl-C para dejarlo; el timer seguirá sondeando solo)…" >&2
+  echo "esperando la aceptación (Ctrl-C para dejarlo; el sondeo seguirá intentándolo solo)…" >&2
   local _intento
   # shellcheck disable=SC2034
-  for _intento in $(seq 1 90); do
-    sleep 10
+  for _intento in $(seq 1 180); do
+    sleep 5
     invitacion_canjear
     case $? in
       0)

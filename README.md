@@ -41,7 +41,7 @@ Linux (IONOS, DigitalOcean, o el que venga).
 | `contenedores` | Docker: imagen, estado, salud, reinicios, **proyecto/servicio/directorio de docker compose**, puertos publicados, si expone a internet, y **repositorio de origen aunque no haya checkout en disco** (etiqueta OCI `org.opencontainers.image.source` o inferido de `ghcr.io/<org>/<repo>`) |
 | `aplicaciones` | Directorios de despliegue detectados (compose, cwd de procesos vivos, `/var/www`, `/srv`, `/opt`, `/home/*`) con **repositorio git de origen, rama, commit y fecha** |
 | `red.puertos` | Todo lo que escucha: protocolo, puerto, dirección de escucha, proceso, y si está expuesto |
-| `web` | Dominios servidos (nginx/apache) y certificados TLS con días restantes |
+| `web` | Dominios servidos (nginx/apache/**caddy**), **sitios del proxy inverso** (por cada sitio de caddy: dominios, upstreams de `reverse_proxy` y raíces de ficheros, leídos de su admin API en JSON) y certificados TLS con días restantes (incluidos los que gestiona caddy) |
 | `accesos` | Usuarios con shell, sudo, último acceso, y **huellas de todas las authorized_keys** |
 | `parches` | Actualizaciones de seguridad pendientes, unattended-upgrades, reinicio pendiente, paquetes instalados a mano |
 | `tareasProgramadas` | Cron (sistema y usuarios, saneado) y timers de systemd |
@@ -49,6 +49,18 @@ Linux (IONOS, DigitalOcean, o el que venga).
 | `seguridad` | ufw/nftables, reglas `DOCKER-USER`, configuración efectiva del sshd, fail2ban, NTP, registros |
 | `recursos` | Discos, inodos, memoria, carga |
 | `versiones` | Versiones de node, python, php, nginx, docker, git, openssl, psql |
+
+### Las webs detrás del proxy inverso
+
+Con caddy presente, el informe además dice qué **dominios** sirve el servidor
+y hacia dónde manda cada uno (`web.sitios`). El backend cruza el puerto del
+upstream con los puertos publicados de los contenedores y cuelga cada dominio
+de su servicio: «examenes.lyn.es lo sirve el servicio examenes». Un sitio
+cuyo upstream no casa con ningún servicio (una web estática, un destino
+remoto) se inventaría como recurso `sitio` propio. Y como varios servicios
+pueden compartir repositorio (app, worker, mcp del mismo proyecto), la
+reconciliación del SGSI los empareja **deterministamente** con el activo cuya
+URL coincide con ese repositorio, sin pasar por la IA.
 
 ### El mapeo a activos y repositorios
 

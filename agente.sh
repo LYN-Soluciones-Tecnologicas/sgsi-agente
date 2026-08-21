@@ -29,7 +29,7 @@
 # Requiere: bash 4+, jq, coreutils. Todo lo demás (docker, ss, ufw, nft,
 # sshd, fail2ban, nginx, openssl…) se usa solo si está.
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 CONFIG="/etc/sgsi-agente/config"
 ESTADO_DIR="/var/lib/sgsi-agente"
 # El token de entrega y el código de invitación viven en el estado del agente
@@ -273,9 +273,13 @@ col_puertos() {
   | jq -s 'unique_by([.proto, .puerto, .direccion])'
 }
 
-# ── Web: dominios servidos y certificados ──────────────────────────────────
+# ── Web: dominios servidos, sitios del proxy inverso y certificados ────────
+# `sitios` es la pieza que permite el mapeo web→servicio: por cada sitio dice
+# QUÉ dominios atiende y HACIA DÓNDE los manda (upstreams de reverse_proxy o
+# raíz de ficheros). El backend cruza el puerto del upstream con los puertos
+# publicados de los contenedores y cuelga cada dominio de su servicio.
 col_web() {
-  local dominios='[]' certs='[]' renovacion=false
+  local dominios='[]' certs='[]' renovacion=false sitios='[]'
 
   if hay nginx; then
     dominios=$(nginx -T 2>/dev/null \
@@ -288,8 +292,30 @@ col_web() {
     [ -n "$dominios" ] || dominios='[]'
   fi
 
+  # Caddy: su admin API (127.0.0.1:2019) da la config YA en JSON: nada de
+  # parsear Caddyfiles. De cada ruta con host salen dominios, upstreams de
+  # reverse_proxy y raíces de file_server; las rutas sin host (comodín) no
+  # nombran ninguna web y se omiten.
+  local caddy_config
+  caddy_config=$(curl -s --max-time 5 http://127.0.0.1:2019/config/ 2>/dev/null)
+  if [ -n "$caddy_config" ] && printf '%s' "$caddy_config" | jq -e '.apps.http' >/dev/null 2>&1; then
+    sitios=$(printf '%s' "$caddy_config" | jq '
+      [.apps.http.servers // {} | to_entries[] | .value.routes[]?
+       | {servidor: "caddy",
+          dominios: ([.match[]?.host[]?] | unique),
+          upstreams: ([.. | objects | select(.handler? == "reverse_proxy") | .upstreams[]?.dial] | unique),
+          raices: ([.. | objects | .root? // empty] | unique)}
+       | select((.dominios | length) > 0)]')
+    [ -n "$sitios" ] || sitios='[]'
+    dominios=$(printf '%s\n%s\n' "$dominios" "$sitios" \
+      | jq -s '.[0] + [.[1][].dominios[]] | unique')
+    # Caddy renueva sus certificados solo: activo = renovación automática.
+    systemctl is-active --quiet caddy 2>/dev/null && renovacion=true
+  fi
+
   if hay openssl; then
     certs=$( { find /etc/letsencrypt/live -name fullchain.pem 2>/dev/null;
+               find /var/lib/caddy -name '*.crt' -path '*certificates*' 2>/dev/null;
                nginx -T 2>/dev/null \
                  | awk '/^[ \t]*ssl_certificate[ \t]/ {gsub(/;/, "", $2); print $2}'; } \
       | sort -u | while IFS= read -r c; do
@@ -308,9 +334,10 @@ col_web() {
 
   systemctl is-active --quiet certbot.timer 2>/dev/null && renovacion=true
 
-  jq -n --argjson dominios "$dominios" --argjson certificados "$certs" \
+  jq -n --argjson dominios "$dominios" --argjson sitios "$sitios" \
+    --argjson certificados "$certs" \
     --argjson renovacionAutomatica "$renovacion" \
-    '{dominios: $dominios, certificados: $certificados,
+    '{dominios: $dominios, sitios: $sitios, certificados: $certificados,
       renovacionAutomatica: $renovacionAutomatica}'
 }
 
